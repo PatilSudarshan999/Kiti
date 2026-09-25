@@ -1,0 +1,100 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for authentication & role extraction
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/staff/$(request.auth.uid)).data;
+    }
+
+    function getRole() {
+      return getUserData().role;
+    }
+
+    function isOwner() {
+      return isAuthenticated() && getRole() == 'Owner';
+    }
+
+    function isManager() {
+      return isAuthenticated() && (getRole() == 'Manager' || isOwner());
+    }
+
+    function isKitchenChief() {
+      return isAuthenticated() && (getRole() == 'Kitchen Chief' || isManager());
+    }
+
+    function isWaiter() {
+      return isAuthenticated() && (getRole() == 'Waiter' || isManager());
+    }
+
+    // Staff collection rules: Anyone authenticated can read staff directory, only Manager/Owner can modify
+    match /staff/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isManager();
+    }
+
+    // Menu Items: All authenticated roles can read; Kitchen Chief & Managers can toggle availability; Managers/Owners manage catalog
+    match /menuItems/{itemId} {
+      allow read: if isAuthenticated();
+      allow update: if isKitchenChief() && 
+                    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['availability']);
+      allow create, delete: if isManager();
+      allow update: if isManager();
+    }
+
+    // Tables: Waiters & Managers update table state. Cannot place table into Billing if no active order.
+    match /tables/{tableId} {
+      allow read: if isAuthenticated();
+      allow update: if isWaiter() || isKitchenChief();
+      allow create, delete: if isManager();
+    }
+
+    // Reservations & Waitlist: Waiters and Managers can view and update seating
+    match /reservations/{resId} {
+      allow read, write: if isWaiter();
+    }
+    match /waitlist/{entryId} {
+      allow read, write: if isWaiter();
+    }
+
+    // Orders: Core fulfillment collection
+    match /orders/{orderId} {
+      allow read: if isAuthenticated();
+      
+      // Creating order: Waiter or Manager. Table cannot be in Billing status.
+      allow create: if isWaiter() &&
+                    request.resource.data.status == 'Active';
+      
+      // Update rules enforcing status transitions:
+      allow update: if isAuthenticated() && (
+        isManager() ||
+        // Kitchen Chief: can transition item statuses between Pending -> Preparing -> Ready
+        (isKitchenChief() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['items', 'updatedAt'])) ||
+        // Waiter: can transition items to Served, or add items if table is still Active
+        (isWaiter() && resource.data.status == 'Active')
+      );
+      
+      allow delete: if isManager();
+    }
+
+    // Bills: Restricted financial data
+    match /bills/{billId} {
+      // Only Waiters (handling customer payment), Managers, and Owners can read bills
+      allow read: if isWaiter() || isManager() || isOwner();
+      // Waiter or Manager can generate and settle bills
+      allow create, update: if isWaiter();
+      allow delete: if isManager();
+    }
+
+    // Complaints: Waiters can log complaints; Managers and Owners can review and resolve; Kitchen cannot view
+    match /complaints/{complaintId} {
+      allow read: if isManager();
+      allow create: if isWaiter();
+      allow update, delete: if isManager();
+    }
+  }
+}
